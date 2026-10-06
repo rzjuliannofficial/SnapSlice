@@ -22,13 +22,14 @@ KEBUTUHAN
 
 STRUKTUR
 --------
-YKAN_Manual_Reviewer/
-├── pecah gambar.py
+SnapSlice/
+├── SnapSlice.py
 ├── requirements.txt
 ├── JALANKAN.bat
+├── README.md
 └── README.txt
 
-File runtime dibuat otomatis di samping pecah gambar.py:
+File runtime dibuat otomatis di samping SnapSlice.py:
 - pengaturan.json
 - log_error.txt
 - log_error.old.txt jika log melewati sekitar 1 MB
@@ -38,16 +39,14 @@ File runtime dibuat otomatis di samping pecah gambar.py:
 CARA MENJALANKAN
 ----------------
 Cara utama di Windows:
-1. Masuk ke folder YKAN_Manual_Reviewer.
+1. Masuk ke folder SnapSlice.
 2. Klik dua kali JALANKAN.bat.
-3. Script mencari Python dengan py -3 lalu python nyata, mengecek Tkinter dan dependency.
+3. Script mencari Python, mengecek Tkinter dan dependency.
 4. Jika dependency belum ada, script menjalankan pip install -r requirements.txt.
 5. Aplikasi kemudian dibuka.
 
 Uji tanpa GUI:
-    py -3 "pecah gambar.py" --selftest
-atau:
-    python "pecah gambar.py" --selftest
+    python SnapSlice.py --selftest
 Hasil sukses harus mencetak LULUS.
 
 INPUT GAMBAR
@@ -184,7 +183,7 @@ Format mencakup timestamp, konteks, jenis error, dan traceback lengkap. Saat uku
 MASALAH UMUM
 ------------
 Python tidak ditemukan:
-Pasang Python 3.9-3.13 dari https://www.python.org/downloads/ . Saat instalasi centang Add python.exe to PATH dan Tcl/Tk. Tutup/buka CMD lalu jalankan JALANKAN.bat lagi.
+Pasang Python 3.9+ dari https://www.python.org/downloads/ . Saat instalasi centang Add python.exe to PATH dan Tcl/Tk. Tutup/buka CMD lalu jalankan JALANKAN.bat lagi.
 
 Tkinter tidak tersedia:
 Pasang ulang Python lengkap dengan Tcl/Tk. Cek dengan:
@@ -193,7 +192,7 @@ Pasang ulang Python lengkap dengan Tcl/Tk. Cek dengan:
 Dependency gagal:
 Jalankan:
     python -m pip install -r requirements.txt
-Pastikan internet tersedia dan gunakan Python 3.9-3.13.
+Pastikan internet tersedia dan gunakan Python 3.9+.
 
 File picker tidak muncul:
 Aplikasi memang menggunakan filedialog.askopenfilename/askdirectory bawaan Tkinter. Pastikan Tkinter terpasang dan jendela aplikasi tidak diblokir oleh security software. Jalur cadangan tetap tersedia: tempel path gambar di kolom lalu klik Muat. Untuk output, masukkan folder lewat dialog; tidak ada file dialog buatan sendiri.

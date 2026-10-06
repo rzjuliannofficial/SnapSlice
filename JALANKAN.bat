@@ -149,7 +149,11 @@ if errorlevel 1 (
 echo [5/5] Membuka aplikasi...
 echo Jangan tutup terminal ini selama aplikasi masih berjalan.
 echo.
-%PY% %PY_ARGS% "pecah gambar.py"
+if exist "SnapSlice.py" (
+    %PY% %PY_ARGS% "SnapSlice.py"
+) else (
+    %PY% %PY_ARGS% "pecah gambar.py"
+)
 set "APP_EXIT=%ERRORLEVEL%"
 
 echo.
