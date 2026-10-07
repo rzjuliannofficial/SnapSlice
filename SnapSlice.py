@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
-from PIL import Image, ImageFilter, ImageOps, ImageTk
+from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -643,6 +643,146 @@ def unique_export_path(directory: Path, prefix: str, number: int) -> Path:
         idx += 1
 
 
+def sample_dominant_background_colors(
+    arr_rgb: np.ndarray,
+    bg_override: Optional[Tuple[int, int, int]] = None,
+) -> List[np.ndarray]:
+    """Mengambil kluster warna background dominan dari perimeter (tepi) gambar."""
+    h, w, _ = arr_rgb.shape
+    if h == 0 or w == 0:
+        return [np.array([255.0, 255.0, 255.0], dtype=np.float32)]
+
+    depth = max(1, min(5, min(h, w) // 10))
+    rim_parts = [
+        arr_rgb[:depth, :, :].reshape(-1, 3),
+        arr_rgb[-depth:, :, :].reshape(-1, 3),
+        arr_rgb[:, :depth, :].reshape(-1, 3),
+        arr_rgb[:, -depth:, :].reshape(-1, 3),
+    ]
+    rim = np.concatenate(rim_parts, axis=0).astype(np.float32)
+
+    bg_clusters: List[np.ndarray] = []
+    if bg_override is not None:
+        bg_clusters.append(np.array(bg_override, dtype=np.float32))
+
+    # Kuantisasi warna rim ke bin 16
+    q = (np.clip(rim, 0, 255) // 16).astype(np.int32)
+    codes = q[:, 0] * 256 + q[:, 1] * 16 + q[:, 2]
+    unique_codes, counts = np.unique(codes, return_counts=True)
+    sorted_idx = np.argsort(-counts)
+
+    total_rim = len(rim)
+    for idx in sorted_idx:
+        pct = counts[idx] / total_rim
+        if pct >= 0.04:  # Kluster mencakup minimal 4% perimeter
+            code = unique_codes[idx]
+            mask_code = codes == code
+            mean_color = rim[mask_code].mean(axis=0)
+            if not any(np.max(np.abs(mean_color - c)) < 15 for c in bg_clusters):
+                bg_clusters.append(mean_color)
+
+    if not bg_clusters:
+        mean_rim = rim.mean(axis=0)
+        bg_clusters.append(mean_rim)
+
+    return bg_clusters
+
+
+def remove_background_from_crop(
+    crop: Image.Image,
+    box: Tuple[int, int, int, int],
+    rec: Optional[Dict[str, Any]] = None,
+    label_map: Optional[np.ndarray] = None,
+    bg_color: Optional[Tuple[int, int, int]] = None,
+    tolerance: int = 30,
+    clean_neighbors: bool = True,
+    clean_holes: bool = True,
+    defringe: bool = True,
+) -> Image.Image:
+    """
+    Menghapus background dari crop objek dan menghasilkan gambar RGBA dengan background transparan bersih.
+    - Multi-modal background detection: mendeteksi background solid, checkerboard (pola catur),
+      maupun warna kustom apa pun yang ada pada tepi gambar.
+    - clean_holes: membersihkan latar belakang di dalam rongga/lubang huruf (seperti B, O, dsb).
+    - defringe: erosi 1px + penghalusan anti-aliasing untuk membuang halo/lis warna sisa di pinggir objek.
+    - clean_neighbors: membersihkan potongan objek tetangga yang masuk ke dalam crop.
+    """
+    crop_rgba = crop.convert("RGBA")
+    w, h = crop_rgba.size
+    if w <= 0 or h <= 0:
+        return crop_rgba
+
+    arr = np.asarray(crop_rgba).copy()
+    rgb = arr[..., :3].astype(np.float32)
+    orig_alpha = arr[..., 3]
+
+    # 1. Deteksi kluster warna background dari perimeter
+    bg_clusters = sample_dominant_background_colors(arr[..., :3], bg_override=bg_color)
+
+    # 2. Hitung jarak minimum piksel ke kluster background
+    min_diff = np.full((h, w), 999.0, dtype=np.float32)
+    for bg_c in bg_clusters:
+        d = np.max(np.abs(rgb - bg_c), axis=2)
+        min_diff = np.minimum(min_diff, d)
+
+    eff_tolerance = max(20, int(tolerance))
+    is_bg_candidate = min_diff <= eff_tolerance
+
+    # Jika gambar aslinya sudah punya alpha transparan
+    if float(np.mean(orig_alpha < 250)) >= 0.05:
+        is_bg_candidate |= orig_alpha < 128
+
+    # 3. Pisahkan komponen tetangga jika ada label_map
+    other_comps_mask: Optional[np.ndarray] = None
+    if rec and label_map is not None:
+        sub_labels = label_map[box[1] : box[3], box[0] : box[2]]
+        cids = [int(v) for v in rec.get("component_ids", [])]
+        if cids:
+            this_ids = set(cids)
+            if clean_neighbors and sub_labels.shape == (h, w):
+                other_comps_mask = (sub_labels > 0) & (~np.isin(sub_labels, list(this_ids)))
+                is_definite_foreground = np.isin(sub_labels, list(this_ids))
+                is_bg_candidate &= ~is_definite_foreground
+
+    # 4. Deteksi background eksterior via flood-fill dari tepi
+    mask_l = Image.fromarray((is_bg_candidate.astype(np.uint8) * 255), mode="L").copy()
+    for x in range(w):
+        if mask_l.getpixel((x, 0)) == 255:
+            ImageDraw.floodfill(mask_l, (x, 0), 128)
+        if mask_l.getpixel((x, h - 1)) == 255:
+            ImageDraw.floodfill(mask_l, (x, h - 1), 128)
+    for y in range(h):
+        if mask_l.getpixel((0, y)) == 255:
+            ImageDraw.floodfill(mask_l, (0, y), 128)
+        if mask_l.getpixel((w - 1, y)) == 255:
+            ImageDraw.floodfill(mask_l, (w - 1, y), 128)
+
+    exterior_bg = np.asarray(mask_l) == 128
+
+    if clean_holes:
+        final_bg = is_bg_candidate
+    else:
+        final_bg = exterior_bg
+
+    if other_comps_mask is not None:
+        final_bg |= other_comps_mask
+
+    # Mask foreground awal
+    fg_mask = ~final_bg
+
+    # 5. Defringing & Smoothing tepi
+    pil_fg = Image.fromarray((fg_mask.astype(np.uint8) * 255), mode="L")
+    if defringe:
+        eroded = pil_fg.filter(ImageFilter.MinFilter(size=3))
+        smoothed = eroded.filter(ImageFilter.GaussianBlur(radius=0.6))
+        alpha_final = np.asarray(smoothed, dtype=np.uint8)
+    else:
+        alpha_final = np.asarray(pil_fg, dtype=np.uint8)
+
+    arr[..., 3] = alpha_final
+    return Image.fromarray(arr, mode="RGBA")
+
+
 def export_boxes_pure(
     image: Image.Image,
     boxes: Sequence[Dict[str, Any]],
@@ -652,6 +792,11 @@ def export_boxes_pure(
     label_map: Optional[np.ndarray] = None,
     clean_neighbors: bool = True,
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    remove_bg: bool = False,
+    bg_color: Optional[Tuple[int, int, int]] = None,
+    tolerance: int = 30,
+    clean_holes: bool = True,
+    defringe: bool = True,
 ) -> List[Path]:
     if not boxes:
         raise UserFacingError("Tidak ada kotak untuk diekspor.")
@@ -678,25 +823,38 @@ def export_boxes_pure(
         if box[2] - box[0] < 1 or box[3] - box[1] < 1:
             raise UserFacingError(f"Kotak nomor {idx + 1:03d} memiliki ukuran nol dan tidak bisa diekspor.")
         crop = image_crop_for_export(image, box)
-        should_clean = (
-            clean_neighbors
-            and rec.get("source") == "auto"
-            and rec.get("cleanable", False)
-            and label_map is not None
-            and image_has_alpha_mode(image)
-        )
-        if should_clean:
-            ids = set(int(v) for v in rec.get("component_ids", []))
-            if ids:
-                labels = label_map[box[1] : box[3], box[0] : box[2]]
-                if "A" in crop.getbands():
-                    arr = np.asarray(crop).copy()
-                    alpha_index = crop.getbands().index("A")
-                    keep = np.isin(labels, list(ids))
-                    alpha = arr[..., alpha_index]
-                    alpha[~keep] = 0
-                    arr[..., alpha_index] = alpha
-                    crop = Image.fromarray(arr, mode=crop.mode)
+        if remove_bg:
+            crop = remove_background_from_crop(
+                crop,
+                box,
+                rec=rec,
+                label_map=label_map,
+                bg_color=bg_color,
+                tolerance=tolerance,
+                clean_neighbors=clean_neighbors,
+                clean_holes=clean_holes,
+                defringe=defringe,
+            )
+        else:
+            should_clean = (
+                clean_neighbors
+                and rec.get("source") == "auto"
+                and rec.get("cleanable", False)
+                and label_map is not None
+                and image_has_alpha_mode(image)
+            )
+            if should_clean:
+                ids = set(int(v) for v in rec.get("component_ids", []))
+                if ids:
+                    labels = label_map[box[1] : box[3], box[0] : box[2]]
+                    if "A" in crop.getbands():
+                        arr = np.asarray(crop).copy()
+                        alpha_index = crop.getbands().index("A")
+                        keep = np.isin(labels, list(ids))
+                        alpha = arr[..., alpha_index]
+                        alpha[~keep] = 0
+                        arr[..., alpha_index] = alpha
+                        crop = Image.fromarray(arr, mode=crop.mode)
         destination = unique_export_path(output_dir, prefix, idx + 1)
         if len(str(destination)) > 260:
             raise PathTooLongError(f"Path file output terlalu panjang (>260 karakter):\n{destination}")
@@ -1991,21 +2149,134 @@ class BoxEditorApp:
         self.autosave_session()
 
     def _ensure_export_label_map(self) -> None:
-        if not self.original or not any(b.get("cleanable") for b in self.boxes):
+        if not self.original or not any(b.get("source") == "auto" for b in self.boxes):
             return
         if self.label_map is not None:
             return
-        result = detect_automatic(
-            self.original,
-            tolerance=int(self.tolerance_var.get()),
-            merge_distance=int(self.merge_distance_var.get()),
-            min_size=int(self.min_size_var.get()),
-            padding=int(self.padding_var.get()),
-            merge_contained=bool(self.merge_contained_var.get()),
-            alpha_threshold=int(self.alpha_threshold_var.get()),
-            bg_override=self.auto_background,
+        try:
+            result = detect_automatic(
+                self.original,
+                tolerance=int(self.tolerance_var.get()),
+                merge_distance=int(self.merge_distance_var.get()),
+                min_size=int(self.min_size_var.get()),
+                padding=int(self.padding_var.get()),
+                merge_contained=bool(self.merge_contained_var.get()),
+                alpha_threshold=int(self.alpha_threshold_var.get()),
+                bg_override=self.auto_background,
+            )
+            self.label_map = result.get("label_map")
+        except Exception:
+            pass
+
+    def _ask_background_removal_option(self) -> Optional[Dict[str, Any]]:
+        """Menampilkan dialog popup untuk memilih penanganan background:
+        - {"remove_bg": True, "clean_holes": bool, "defringe": bool}: Menghapus background
+        - {"remove_bg": False}: Mempertahankan background asli
+        - None: Batal
+        """
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Opsi Pemisahan Gambar - SnapSlice")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        result: Dict[str, Optional[Dict[str, Any]]] = {"choice": None}
+
+        main_frame = ttk.Frame(dialog, padding=(24, 20))
+        main_frame.pack(fill="both", expand=True)
+
+        lbl_title = ttk.Label(
+            main_frame,
+            text="Pilih Penanganan Background",
+            font=("Segoe UI", 12, "bold"),
         )
-        self.label_map = result.get("label_map")
+        lbl_title.pack(anchor="w", pady=(0, 4))
+
+        lbl_desc = ttk.Label(
+            main_frame,
+            text="Tentukan apakah latar belakang gambar yang dipisah akan dihapus\nmenjadi transparan atau dipertahankan seperti aslinya:",
+            font=("Segoe UI", 9),
+            justify="left",
+        )
+        lbl_desc.pack(anchor="w", pady=(0, 14))
+
+        def choose(val: Optional[Dict[str, Any]]) -> None:
+            result["choice"] = val
+            dialog.destroy()
+
+        # Opsi 1
+        f1 = ttk.LabelFrame(main_frame, text="Pilihan 1: Hapus Background", padding=12)
+        f1.pack(fill="x", pady=(0, 12))
+
+        clean_holes_var = tk.BooleanVar(value=True)
+        defringe_var = tk.BooleanVar(value=True)
+
+        btn_remove = ttk.Button(
+            f1,
+            text="✂️ Hapus Background (Transparan PNG Bersih)",
+            command=lambda: choose({
+                "remove_bg": True,
+                "clean_holes": clean_holes_var.get(),
+                "defringe": defringe_var.get(),
+            }),
+        )
+        btn_remove.pack(fill="x", pady=(0, 8))
+
+        chk_holes = ttk.Checkbutton(
+            f1,
+            text="Bersihkan rongga/lubang di dalam objek (misal: huruf B, O, dsb.)",
+            variable=clean_holes_var,
+        )
+        chk_holes.pack(anchor="w", pady=(0, 4))
+
+        chk_defringe = ttk.Checkbutton(
+            f1,
+            text="Haluskan tepian objek & buang sisa lis/halo background (Anti-halo)",
+            variable=defringe_var,
+        )
+        chk_defringe.pack(anchor="w")
+
+        # Opsi 2
+        f2 = ttk.LabelFrame(main_frame, text="Pilihan 2: Pertahankan Asli", padding=12)
+        f2.pack(fill="x", pady=(0, 14))
+        btn_keep = ttk.Button(
+            f2,
+            text="🖼️ Pertahankan Background Asli",
+            command=lambda: choose({"remove_bg": False}),
+        )
+        btn_keep.pack(fill="x", pady=(0, 4))
+        lbl_sub2 = ttk.Label(
+            f2,
+            text="Warna latar belakang asli tetap disimpan apa adanya tanpa diubah.",
+            font=("Segoe UI", 8),
+            foreground="#555555",
+            justify="left",
+        )
+        lbl_sub2.pack(anchor="w")
+
+        btn_cancel = ttk.Button(
+            main_frame,
+            text="Batal",
+            command=lambda: choose(None),
+        )
+        btn_cancel.pack(anchor="e")
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        btn_remove.focus_set()
+
+        dialog.update_idletasks()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        dw = dialog.winfo_reqwidth()
+        dh = dialog.winfo_reqheight()
+        x = max(0, rx + (rw - dw) // 2)
+        y = max(0, ry + (rh - dh) // 2)
+        dialog.geometry(f"+{x}+{y}")
+
+        dialog.wait_window()
+        return result["choice"]
 
     def _validate_export_setup(self) -> Tuple[Path, str]:
         if not self.original or not self.image_path:
@@ -2038,6 +2309,17 @@ class BoxEditorApp:
             if len(self.boxes) > MAX_BOXES_CONFIRM:
                 if not messagebox.askyesno("Banyak kotak", f"Ada {len(self.boxes)} kotak. Ekspor dapat menghasilkan banyak file. Lanjutkan?", parent=self.root):
                     return
+
+            bg_choice = self._ask_background_removal_option()
+            if bg_choice is None:
+                return
+            remove_bg = bool(bg_choice.get("remove_bg", False))
+            clean_holes = bool(bg_choice.get("clean_holes", True))
+            defringe = bool(bg_choice.get("defringe", True))
+
+            if remove_bg:
+                self._ensure_export_label_map()
+
             self.save_session_now()
             if not output.exists():
                 try:
@@ -2048,6 +2330,8 @@ class BoxEditorApp:
             boxes_snapshot = copy.deepcopy(self.boxes)
             label_map = None if self.label_map is None else self.label_map.copy()
             clean_neighbors = bool(self.clean_neighbors_var.get())
+            bg_color = self.auto_background
+            tolerance = int(self.tolerance_var.get())
         except Exception as exc:
             if isinstance(exc, UserFacingError):
                 self.show_user_error(str(exc), context, exc)
@@ -2073,6 +2357,11 @@ class BoxEditorApp:
                     label_map=label_map,
                     clean_neighbors=clean_neighbors,
                     progress_cb=progress_cb,
+                    remove_bg=remove_bg,
+                    bg_color=bg_color,
+                    tolerance=tolerance,
+                    clean_holes=clean_holes,
+                    defringe=defringe,
                 )
                 self.root.after(0, lambda w=written: self._export_done(w, output))
             except Exception as exc:
@@ -2291,6 +2580,42 @@ def run_selftest() -> int:
             if int(clean_export[:, 55:, 3].max()) != 0:
                 failed.append("alpha cleanup tetangga tidak menjadi alpha=0")
 
+        # Uji fitur Hapus Background (remove_bg=True vs remove_bg=False)
+        src_opaque = Image.open(opaque_path)
+        try:
+            out_keep = temp_root / "test_keep_bg"
+            out_nobg = temp_root / "test_remove_bg"
+            box_test = [
+                {
+                    "box": (70, 70, 190, 190),
+                    "uid": 1,
+                    "source": "auto",
+                    "cleanable": False,
+                    "component_ids": [1],
+                }
+            ]
+            # 1. Pertahankan background (remove_bg=False)
+            w_keep = export_boxes_pure(src_opaque, box_test, [0], out_keep, "keep", remove_bg=False)
+            img_k = Image.open(w_keep[0])
+            arr_k = np.array(img_k)
+            if tuple(arr_k[0, 0, :3]) != (255, 255, 255):
+                failed.append("remove_bg=False tidak mempertahankan background putih")
+            img_k.close()
+
+            # 2. Hapus background (remove_bg=True)
+            w_nobg = export_boxes_pure(src_opaque, box_test, [0], out_nobg, "nobg", remove_bg=True, bg_color=(255, 255, 255))
+            img_nb = Image.open(w_nobg[0])
+            arr_nb = np.array(img_nb)
+            if img_nb.mode != "RGBA":
+                failed.append("remove_bg=True tidak menghasilkan mode RGBA")
+            elif arr_nb[0, 0, 3] != 0:
+                failed.append(f"remove_bg=True sudut tidak transparan: alpha={arr_nb[0, 0, 3]}")
+            elif arr_nb[arr_nb.shape[0] // 2, arr_nb.shape[1] // 2, 3] != 255:
+                failed.append("remove_bg=True objek tengah tidak opaque (alpha != 255)")
+            img_nb.close()
+        finally:
+            src_opaque.close()
+
         # Uji prefix invalid dan grid invalid untuk jalur error pure.
         try:
             valid_prefix("a:b")
@@ -2316,7 +2641,7 @@ def run_selftest() -> int:
         return 1
     print("LULUS")
     print("9/9 objek terdeteksi pada background putih dan transparan.")
-    print("Grid 3x4, roundtrip koordinat, ekspor tanpa overwrite, dan hash gambar asli lulus.")
+    print("Grid 3x4, roundtrip koordinat, ekspor (pertahankan & hapus background), dan hash gambar asli lulus.")
     return 0
 
 
